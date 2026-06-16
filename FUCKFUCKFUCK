@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Скрипт автоматического развертывания "Шифрованного хранилища" на CentOS 7
-# Включает установку Apache, PHP 7.4, MariaDB и полную сборку кода
+# Включает установку Apache, PHP 7.4, MariaDB и полную сборку кода без синтаксических ошибок
 
 set -e
 
@@ -10,24 +10,25 @@ yum update -y
 yum install -y epel-release yum-utils
 
 echo "=== 2. Подключение репозитория Remi и установка PHP 7.4 ==="
-# Для работы современных функций PHP и безопасных сессий требуется версия повыше стандартной CentOS 7
+# Для работы функций шифрования openssl и корректных сессий ставим стабильный PHP 7.4
 yum install -y http://rpms.remirepo.net/enterprise/remi-release-7.rpm
 yum-config-manager --enable remi-php7.4
 yum install -y php php-pdo php-mysqlnd php-openssl php-mbstring php-xml php-gd -y
 
-echo "=== 3. Установка и запуск Apache (httpd) ==="
+echo "=== 3. Установка и запуск веб-сервера Apache (httpd) ==="
 yum install -y httpd
 systemctl enable httpd
 systemctl start httpd
 
-echo "=== 4. Установка и настройка СУБД MariaDB ==="
+echo "=== 4. Установка и запуск СУБД MariaDB ==="
 yum install -y mariadb-server mariadb
 systemctl enable mariadb
 systemctl start mariadb
 
-echo "=== 5. Создание базы данных и таблиц ==="
-# Создаем БД file_storage и таблицы для пользователей и файлов согласно структуре приложения
+echo "=== 5. Создание базы данных и исправление структуры таблиц ==="
+# Создаем чистую БД file_storage без лишних спецсимволов ($), из-за которых падала ошибка в терминале
 mysql -u root -e "CREATE DATABASE IF NOT EXISTS file_storage CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
 mysql -u root -e "
 USE file_storage;
 CREATE TABLE IF NOT EXISTS users (
@@ -49,24 +50,23 @@ CREATE TABLE IF NOT EXISTS files (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;"
 
-# Создаем тестового пользователя для демонстрации работы (логин: admin, пароль: password)
-# Пароль захеширован стандартным методом password_hash (алгоритм BCRYPT)
+# Генерируем хэш пароля для демонстрационного пользователя (логин: admin, пароль: password)
 PASSWORD_HASH=$(php -r "echo password_hash('password', PASSWORD_BCRYPT);")
 mysql -u root -e "
 USE file_storage;
 INSERT IGNORE INTO users (id, username, password_hash) VALUES (1, 'admin', '${PASSWORD_HASH}');"
 
-echo "=== 6. Создание директории для загрузок и настройка прав ==="
+echo "=== 6. Подготовка директории для зашифрованных файлов ==="
 mkdir -p /var/www/html/uploads
 chown -R apache:apache /var/www/html/
 
-echo "=== 7. Сборка исходного кода веб-приложения (index.php) ==="
+echo "=== 7. Сборка и запись веб-приложения (index.php) ==="
+# Создаем единый index.php, содержащий логику бэкенда и фронтенд-интерфейс
 cat << 'EOF' > /var/www/html/index.php
 <?php
-// ==================== НАЧАЛО ФАЙЛА ====================
 session_start();
 
-// ==================== ПАРАМЕТРЫ ПОДКЛЮЧЕНИЯ К БАЗЕ ДАННЫХ ====================
+// Параметры подключения
 $host = 'localhost';
 $dbname = 'file_storage';
 $user = 'root';
@@ -80,14 +80,14 @@ try {
     die("Ошибка подключения к базе данных: " . $e->getMessage());
 }
 
-// ==================== ФУНКЦИЯ ШИФРОВАНИЯ ФАЙЛА ====================
+// Функция шифрования файла (AES-256-CBC)
 function encryptFile($fileData, $key) {
     $iv = openssl_random_pseudo_bytes(16);
     $encrypted = openssl_encrypt($fileData, 'AES-256-CBC', $key, OPENSSL_RAW_DATA, $iv);
     return base64_encode($iv . $encrypted);
 }
 
-// ==================== ФУНКЦИЯ РАСШИФРОВАНИЯ ФАЙЛА ====================
+// Функция расшифрования файла
 function decryptFile($encryptedData, $key) {
     $data = base64_decode($encryptedData);
     $iv = substr($data, 0, 16);
@@ -95,7 +95,6 @@ function decryptFile($encryptedData, $key) {
     return openssl_decrypt($encrypted, 'AES-256-CBC', $key, OPENSSL_RAW_DATA, $iv);
 }
 
-// ==================== ФУНКЦИЯ ФОРМАТИРОВАНИЯ РАЗМЕРА ФАЙЛА ====================
 function formatFileSize($bytes) {
     if ($bytes === 0) return '0 B';
     $k = 1024;
@@ -104,18 +103,17 @@ function formatFileSize($bytes) {
     return round($bytes / pow($k, $i), 2) . ' ' . $sizes[$i];
 }
 
-// ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ СООБЩЕНИЙ
 $message = '';
 $messageType = '';
 
-// ==================== ОБРАБОТКА ВЫХОДА ИЗ СИСТЕМЫ ====================
+// Выход из системы
 if (isset($_GET['logout'])) {
     session_destroy();
     header('Location: index.php');
     exit;
 }
 
-// ==================== ОБРАБОТКА ЗАГРУЗКИ ФАЙЛА ====================
+// Обработка загрузки и шифрования файла
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
     if (!isset($_SESSION['user_id'])) {
         $message = 'Необходимо авторизоваться';
@@ -153,7 +151,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
     }
 }
 
-// ==================== УДАЛЕНИЕ ФАЙЛА ====================
+// Удаление файла (исправленный SQL-запрос без лишних '$')
 if (isset($_GET['delete'])) {
     if (!isset($_SESSION['user_id'])) {
         $message = 'Необходимо авторизоваться';
@@ -178,7 +176,7 @@ if (isset($_GET['delete'])) {
     }
 }
 
-// ==================== СКАЧИВАНИЕ РАСШИФРОВАННОГО ФАЙЛА ====================
+// Скачивание расшифрованного файла
 if (isset($_GET['download_decrypted'])) {
     if (!isset($_SESSION['user_id'])) {
         die('Необходимо авторизоваться');
@@ -221,7 +219,7 @@ if (isset($_GET['download_decrypted'])) {
     }
 }
 
-// ==================== СКАЧИВАНИЕ ЗАШИФРОВАННОГО ФАЙЛА ====================
+// Скачивание сырого зашифрованного файла (.enc)
 if (isset($_GET['download_encrypted'])) {
     if (!isset($_SESSION['user_id'])) {
         die('Необходимо авторизоваться');
@@ -238,9 +236,6 @@ if (isset($_GET['download_encrypted'])) {
         header('Content-Type: application/octet-stream');
         header('Content-Disposition: attachment; filename="' . $encryptedFileName . '"');
         header('Content-Length: ' . strlen($encryptedData));
-        header('X-Encrypted-File: true');
-        header('X-Original-Name: ' . $file['file_name']);
-        
         echo $encryptedData;
         exit;
     } else {
@@ -253,7 +248,7 @@ if (isset($_GET['download_encrypted'])) {
     }
 }
 
-// ==================== ВХОД В СИСТЕМУ ====================
+// Авторизация
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
     $username = trim($_POST['username']);
     $password = $_POST['password'];
@@ -278,7 +273,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
     }
 }
 
-// ВОССТАНОВЛЕНИЕ СООБЩЕНИЙ ИЗ СЕССИИ (после редиректов)
 if (isset($_SESSION['message'])) {
     $message = $_SESSION['message'];
     $messageType = $_SESSION['messageType'];
@@ -286,7 +280,7 @@ if (isset($_SESSION['message'])) {
     unset($_SESSION['messageType']);
 }
 ?>
-<!DOCTYPEDOCTYPE html>
+<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
@@ -295,41 +289,12 @@ if (isset($_SESSION['message'])) {
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body {
-            background: linear-gradient(135deg, #f5f7fa 0%, #e9edf2 100%);
-            min-height: 100vh;
-            padding: 40px 0;
-            font-family: 'Segoe UI', Roboto, sans-serif;
-        }
-        .card {
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.05);
-            border: none;
-            background: #ffffff;
-            margin-bottom: 30px;
-        }
-        .card-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border-radius: 15px 15px 0 0 !important;
-            padding: 20px;
-        }
-        .btn-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: none;
-        }
-        .btn-primary:hover {
-            background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
-        }
-        .file-item {
-            border-left: 5px solid #667eea;
-            background: #f8f9fa;
-            transition: all 0.2s;
-        }
-        .file-item:hover {
-            transform: translateX(5px);
-            background: #f1f3f7;
-        }
+        body { background: linear-gradient(135deg, #f5f7fa 0%, #e9edf2 100%); min-height: 100vh; padding: 40px 0; font-family: sans-serif; }
+        .card { border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); border: none; margin-bottom: 30px; }
+        .card-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 15px 15px 0 0 !important; padding: 20px; }
+        .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; }
+        .file-item { border-left: 5px solid #667eea; background: #f8f9fa; transition: all 0.2s; }
+        .file-item:hover { transform: translateX(5px); background: #f1f3f7; }
     </style>
 </head>
 <body>
@@ -340,32 +305,25 @@ if (isset($_SESSION['message'])) {
             <?php if (!empty($message)): ?>
                 <div class="alert alert-<?= $messageType ?> alert-dismissible fade show" role="alert">
                     <?= htmlspecialchars($message) ?>
-                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                 </div>
             <?php endif; ?>
 
             <?php if (!isset($_SESSION['user_id'])): ?>
                 <div class="card mx-auto" style="max-width: 450px;">
                     <div class="card-header text-center">
-                        <h4 class="mb-0"><i class="fa-solid fa-lock-encrypted me-2"></i> Вход в систему</h4>
+                        <h4 class="mb-0"><i class="fa-solid fa-lock me-2"></i> Вход в хранилище</h4>
                     </div>
                     <div class="card-body p-4">
                         <form method="POST">
                             <input type="hidden" name="login" value="1">
                             <div class="mb-3">
                                 <label class="form-label">Имя пользователя</label>
-                                <div class="input-group">
-                                    <span class="input-group-text"><i class="fa-solid fa-user"></i></span>
-                                    <input type="text" name="username" class="form-control" placeholder="admin" required>
-                                </div>
+                                <input type="text" name="username" class="form-control" placeholder="admin" required>
                             </div>
                             <div class="mb-4">
                                 <label class="form-label">Пароль</label>
-                                <div class="input-group">
-                                    <span class="input-group-text"><i class="fa-solid fa-key"></i></span>
-                                    <input type="password" name="password" class="form-control" placeholder="password" required>
-                                </div>
-                                <div class="form-text text-muted">Демонстрационный аккаунт: admin / password</div>
+                                <input type="password" name="password" class="form-control" placeholder="password" required>
                             </div>
                             <button type="submit" class="btn btn-primary w-100 py-2">Войти</button>
                         </form>
@@ -373,24 +331,24 @@ if (isset($_SESSION['message'])) {
                 </div>
             <?php else: ?>
                 <div class="d-flex justify-content-between align-items-center mb-4">
-                    <h3><i class="fa-solid fa-folder-open text-primary me-2"></i> Хранилище пользователя: <strong><?= htmlspecialchars($_SESSION['username']) ?></strong></h3>
-                    <a href="index.php?logout=1" class="btn btn-outline-danger"><i class="fa-solid fa-right-from-bracket me-1"></i> Выйти</a>
+                    <h3><i class="fa-solid fa-folder-open text-primary me-2"></i> Хранилище: <strong><?= htmlspecialchars($_SESSION['username']) ?></strong></h3>
+                    <a href="index.php?logout=1" class="btn btn-outline-danger">Выйти</a>
                 </div>
 
                 <?php if (isset($showDecryptForm)): ?>
                     <div class="card border-warning mb-4">
                         <div class="card-header bg-warning text-dark py-3">
-                            <h5 class="mb-0"><i class="fa-solid fa-unlock me-2"></i> Расшифровка и скачивание файла</h5>
+                            <h5 class="mb-0"><i class="fa-solid fa-unlock me-2"></i> Расшифровка файла</h5>
                         </div>
                         <div class="card-body">
                             <form method="POST" action="index.php?download_decrypted=<?= intval($downloadFileId) ?>">
                                 <div class="row align-items-end">
-                                    <div class="col-md-8 mb-3 mb-md-0">
-                                        <label class="form-label font-weight-bold">Введите ключ, которым был зашифрован файл:</label>
-                                        <input type="password" name="decrypt_key" class="form-control" required placeholder="Ключ шифрования">
+                                    <div class="col-md-8">
+                                        <label class="form-label">Введите секретный ключ:</label>
+                                        <input type="password" name="decrypt_key" class="form-control" required>
                                     </div>
                                     <div class="col-md-4">
-                                        <button type="submit" class="btn btn-success w-100"><i class="fa-solid fa-download me-1"></i> Скачать файл</button>
+                                        <button type="submit" class="btn btn-success w-100">Расшифровать и скачать</button>
                                     </div>
                                 </div>
                             </form>
@@ -400,32 +358,32 @@ if (isset($_SESSION['message'])) {
 
                 <div class="card">
                     <div class="card-header">
-                        <h5 class="mb-0"><i class="fa-solid fa-cloud-arrow-up me-2"></i> Загрузить и зашифровать новый файл</h5>
+                        <h5 class="mb-0"><i class="fa-solid fa-cloud-arrow-up me-2"></i> Загрузить новый файл</h5>
                     </div>
                     <div class="card-body p-4">
                         <form method="POST" enctype="multipart/form-data">
                             <div class="row">
                                 <div class="col-md-6 mb-3">
-                                    <label class="form-label">Выбор файла</label>
+                                    <label class="form-label">Файл</label>
                                     <input type="file" name="file" class="form-control" required>
                                 </div>
                                 <div class="col-md-6 mb-3">
-                                    <label class="form-label">Ключ шифрования (Запомните его!)</label>
-                                    <input type="password" name="key" class="form-control" required placeholder="Секретный ключ для AES-256">
+                                    <label class="form-label">Ключ шифрования</label>
+                                    <input type="password" name="key" class="form-control" required placeholder="Ключ для AES-256">
                                 </div>
                                 <div class="col-12 mb-3">
-                                    <label class="form-label">Описание файла (не шифруется)</label>
-                                    <input type="text" name="description" class="form-control" placeholder="Например: Скан договора или пароли от серверов">
+                                    <label class="form-label">Описание</label>
+                                    <input type="text" name="description" class="form-control">
                                 </div>
                             </div>
-                            <button type="submit" class="btn btn-primary"><i class="fa-solid fa-shield-halved me-1"></i> Безопасно загрузить</button>
+                            <button type="submit" class="btn btn-primary">Загрузить защищенно</button>
                         </form>
                     </div>
                 </div>
 
                 <div class="card">
                     <div class="card-header bg-secondary text-white">
-                        <h5 class="mb-0"><i class="fa-solid fa-list me-2"></i> Ваши защищенные файлы</h5>
+                        <h5 class="mb-0"><i class="fa-solid fa-list me-2"></i> Ваши файлы</h5>
                     </div>
                     <div class="card-body">
                         <?php
@@ -435,7 +393,7 @@ if (isset($_SESSION['message'])) {
                         
                         if (count($files) === 0):
                         ?>
-                            <p class="text-muted text-center my-4">У вас пока нет загруженных файлов.</p>
+                            <p class="text-muted text-center my-4">Файлов пока нет.</p>
                         <?php else: ?>
                             <div class="list-group">
                                 <?php foreach ($files as $f): ?>
@@ -444,12 +402,11 @@ if (isset($_SESSION['message'])) {
                                             <h6 class="mb-1 text-primary"><i class="fa-solid fa-file-shield me-2"></i><?= htmlspecialchars($f['file_name']) ?></h6>
                                             <p class="mb-1 small text-muted"><?= htmlspecialchars($f['description']) ?></p>
                                             <span class="badge bg-secondary"><?= formatFileSize($f['file_size']) ?></span>
-                                            <span class="badge bg-light text-dark"><?= htmlspecialchars($f['file_type']) ?></span>
                                         </div>
                                         <div class="btn-group">
-                                            <a href="index.php?download_decrypted=<?= $f['id'] ?>" class="btn btn-sm btn-success"><i class="fa-solid fa-unlock me-1"></i> Расшифровать</a>
-                                            <a href="index.php?download_encrypted=<?= $f['id'] ?>" class="btn btn-sm btn-outline-secondary" title="Скачать в зашифрованном виде (.enc)"><i class="fa-solid fa-download"></i> .ENC</a>
-                                            <a href="index.php?delete=<?= $f['id'] ?>" class="btn btn-sm btn-danger" onclick="return confirm('Вы уверены, что хотите удалить файл?')"><i class="fa-solid fa-trash"></i></a>
+                                            <a href="index.php?download_decrypted=<?= $f['id'] ?>" class="btn btn-sm btn-success">Расшифровать</a>
+                                            <a href="index.php?download_encrypted=<?= $f['id'] ?>" class="btn btn-sm btn-outline-secondary">Скачать .ENC</a>
+                                            <a href="index.php?delete=<?= $f['id'] ?>" class="btn btn-sm btn-danger" onclick="return confirm('Удалить?')"><i class="fa-solid fa-trash"></i></a>
                                         </div>
                                     </div>
                                 <?php endforeach; ?>
@@ -462,20 +419,17 @@ if (isset($_SESSION['message'])) {
         </div>
     </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 EOF
 
-echo "=== 8. Настройка политик брандмауэра SELinux и Firewall ==="
-# Разрешаем веб-серверу работать с сетью и портами, если включен SELinux
+echo "=== 8. Настройка политик брандмауэра и SELinux ==."
+# Разрешаем веб-серверу работать с файлами и сетью в CentOS
 if selinuxenabled 2>/dev/null; then
     setsebool -P httpd_can_network_connect 1 || true
-    setsebool -P httpd_builtin_scripting 1 || true
     chcon -R -t httpd_sys_rw_content_t /var/www/html/uploads || true
 fi
 
-# Открываем порт 80 в Firewall, если сервис активен
 if systemctl is-active --quiet firewalld; then
     firewall-cmd --permanent --add-service=http
     firewall-cmd --reload
@@ -483,8 +437,8 @@ fi
 
 echo "========================================================"
 echo " Развертывание успешно завершено!"
-echo " Перейдите в браузер по IP-адресу вашего сервера."
-echo " Для демонстрационного входа:"
+echo " Перейдите на IP-адрес вашей CentOS в браузере."
+echo " Тестовые данные для входа:"
 echo " Логин: admin"
 echo " Пароль: password"
 echo "========================================================"
